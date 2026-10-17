@@ -139,9 +139,9 @@ def service_by_day(raw_messages):
 # ---------- ОБЩАЯ СТАТИСТИКА ----------
 def general_stats(df, gifts_total):
     total = df.height
-    sender_counts = df.group_by('sender').agg(pl.count()).to_dict(as_series=False)
+    sender_counts = df.group_by('sender').agg(pl.len().alias('count')).to_dict(as_series=False)
     sender_counts = dict(zip(sender_counts['sender'], sender_counts['count']))
-    media_counts = df.group_by('media_type').agg(pl.count()).to_dict(as_series=False)
+    media_counts = df.group_by('media_type').agg(pl.len().alias('count')).to_dict(as_series=False)
     media_counts = dict(zip(media_counts['media_type'], media_counts['count']))
     text_msgs = df.filter(pl.col('media_type') == 'text')
     avg_len = text_msgs['text'].str.len_chars().mean() if text_msgs.height > 0 else 0
@@ -247,7 +247,7 @@ def monthly_analytics(df, gift_df):
     if df.height == 0:
         return pl.DataFrame()
     monthly = df.group_by('year_month').agg([
-        pl.count().alias('messages'),
+        pl.len().alias('messages'),
         pl.sum('words_count').alias('words'),
         pl.col('reply_to').is_not_null().sum().alias('replies'),
         (pl.col('media_type') != 'text').cast(pl.Int32).sum().alias('media'),
@@ -340,7 +340,7 @@ def daily_analytics(df, gift_df, service_df=None, include_service=False):
     if df.height == 0:
         return pl.DataFrame()
     daily = df.group_by('day').agg([
-        pl.count().alias('total'),
+        pl.len().alias('total'),
         pl.n_unique('sender').alias('users'),
         pl.sum('reactions_count').alias('reactions'),
         (pl.col('media_type') == 'photo').cast(pl.Int32).sum().alias('photos'),
@@ -359,10 +359,10 @@ def daily_analytics(df, gift_df, service_df=None, include_service=False):
 
     senders = df['sender'].unique().to_list()
     for sender in senders:
-        sender_df = df.filter(pl.col('sender') == sender).group_by('day').agg(pl.count().alias('count'))
+        sender_df = df.filter(pl.col('sender') == sender).group_by('day').agg(pl.len().alias('count'))
         daily = daily.join(sender_df, on='day', how='left').rename({'count': f'from_{sender}'}).fill_null(0)
 
-    peak_hours = df.group_by(['day', 'hour']).agg(pl.count().alias('count')).sort(['day', 'count'], descending=[False, True])
+    peak_hours = df.group_by(['day', 'hour']).agg(pl.len().alias('count')).sort(['day', 'count'], descending=[False, True])
     peak_hours = peak_hours.unique(subset=['day'], keep='first').select(['day', 'hour']).rename({'hour': 'peak_hour'})
     daily = daily.join(peak_hours, on='day', how='left').fill_null(0)
 
@@ -382,29 +382,88 @@ def daily_analytics(df, gift_df, service_df=None, include_service=False):
 
     return daily
 
-# ---------- ПРОГНОЗИРОВАНИЕ ----------
+# ---------- ПРОГНОЗИРОВАНИЕ (двойное экспоненциальное сглаживание Холта) ----------
+def _holt_fit(y, alpha, beta):
+    """Один проход алгоритма Холта; возвращает SSE, финальный уровень и тренд."""
+    level = y[0]
+    trend = y[1] - y[0] if len(y) > 1 else 0.0
+    sse = 0.0
+    for t in range(1, len(y)):
+        forecast = level + trend
+        sse += (y[t] - forecast) ** 2
+        prev_level = level
+        level = alpha * y[t] + (1 - alpha) * (level + trend)
+        trend = beta * (level - prev_level) + (1 - beta) * trend
+    return sse, level, trend
+
+
 def predict_activity(df, days_ahead=7):
     if df.height == 0:
         return None, None, None, None
-    daily = df.group_by('day').agg(pl.count().alias('count')).sort('day')
+    daily = df.group_by('day').agg(pl.len().alias('count')).sort('day')
     min_day = daily['day'].min()
-    daily = daily.with_columns([
-        (pl.col('day').cast(pl.Date) - min_day).dt.total_days().cast(pl.Int32).alias('day_num')
-    ])
-    X = daily['day_num'].to_numpy().reshape(-1, 1)
-    y = daily['count'].to_numpy()
-    model = LinearRegression()
-    model.fit(X, y)
-    slope = model.coef_[0]
-    intercept = model.intercept_
-    last_day_num = daily['day_num'].max()
-    future_days = np.arange(last_day_num + 1, last_day_num + days_ahead + 1).reshape(-1, 1)
-    pred_counts = model.predict(future_days).astype(int)
-    pred_dates = [min_day + timedelta(days=int(d)) for d in future_days.flatten()]
-    pred_df = pl.DataFrame({'date': pred_dates, 'predicted': pred_counts})
-    return pred_df, slope, intercept, daily
+    max_day = daily['day'].max()
+    span_days = (max_day - min_day).days
+    if span_days < 2:
+        return None, None, None, None
 
-# ---------- ЧАСТОТНЫЕ СЛОВА ----------
+    # Полный календарный ряд: дни без сообщений = 0 (иначе Holt сжимает паузы)
+    all_days = [min_day + timedelta(days=i) for i in range(span_days + 1)]
+    full = (
+        pl.DataFrame({'day': all_days})
+        .join(daily, on='day', how='left')
+        .fill_null(0)
+        .with_columns([
+            pl.col('count').cast(pl.Float64),
+            (pl.col('day') - min_day).dt.total_days().cast(pl.Int32).alias('day_num'),
+        ])
+    )
+
+    # Сглаживание шума: скользящее среднее за 7 дней
+    full = full.with_columns(
+        pl.col('count').rolling_mean(window_size=7, min_samples=1).alias('smoothed')
+    )
+    y = full['smoothed'].to_numpy().astype(float)
+
+    if len(y) >= 3:
+        # Подбираем alpha и beta по минимуму SSE на обучающей выборке
+        best = None
+        for alpha in np.arange(0.1, 1.0, 0.1):
+            for beta in np.arange(0.05, 1.0, 0.05):
+                sse, level, trend = _holt_fit(y, float(alpha), float(beta))
+                if best is None or sse < best[0]:
+                    best = (sse, level, trend)
+        _, level, trend = best
+    else:
+        # Недостаточно данных — скользящее среднее
+        level = float(np.mean(y))
+        trend = 0.0
+
+    # Защита от вырожденного тренда: наклон ограничен ±5% среднего уровня в день,
+    # чтобы шум не «уронил» прогноз в ноль
+    mean_level = float(np.mean(y)) if len(y) else 0.0
+    max_trend = mean_level * 0.05
+    trend = float(np.clip(trend, -max_trend, max_trend))
+
+    slope = float(trend)
+    intercept = float(level)
+    last_day_num = int(full['day_num'].max())
+
+    # Затухание тренда (damping): прогноз сходится к уровню, а не улетает в ноль
+    phi = 0.85
+    horizons = np.arange(1, days_ahead + 1)
+    damp_factors = phi * (1 - phi ** horizons) / (1 - phi)
+    pred_counts = np.maximum(level + trend * damp_factors, 0).round().astype(int)
+
+    # Прогноз не должен уходить ниже разумной доли недавнего среднего уровня
+    recent_mean = float(np.mean(y[-7:])) if len(y) >= 7 else mean_level
+    pred_counts = np.maximum(pred_counts, int(recent_mean * 0.3))
+
+    pred_dates = [min_day + timedelta(days=last_day_num + d) for d in range(1, days_ahead + 1)]
+    pred_df = pl.DataFrame({'date': pred_dates, 'predicted': pred_counts})
+    return pred_df, slope, intercept, full
+
+# ---------- ЧАСТОТНЫЕ СЛОВА ----------# ---------- ЧАСТОТНЫЕ СЛОВА ----------
 def analyze_frequent_words(df, stop_words, top_n=10, min_len=3):
     text_df = df.filter(pl.col('media_type') == 'text')
     if text_df.height == 0:
