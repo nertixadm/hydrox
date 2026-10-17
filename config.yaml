@@ -1,0 +1,27 @@
+analysis:
+  session_gap_hours: 8
+  max_reply_gap_hours: 24
+  top_n_words: 25
+  top_n_bigrams: 20
+  min_word_length: 3
+  stop_words: [и, в, во, не, что, он, на, я, с, со, как, а, то, все, она, так, его, но, да, ты, вы, за, у, о, об, от, до, по, из, или, же, вот, меня, мне, тебя, себе, свой, этот, тот, там, тут, где, когда, тогда, уже, ещё, только, чтобы, потому, поэтому, например, может, быть, очень, теперь, при, без, между, среди, через, после, перед, над, под, около, возле, мимо, против, ради, кроме, включая, несмотря]
+
+colors:
+  user1: "#FF6B6B"
+  user2: "#4ECDC4"
+  background: "#F7F7F7"
+  text: "#2C3E50"
+
+plots:
+  figure_size: [10, 6]
+  dpi: 100
+  font_size: 12
+  max_points_per_plot: 100
+  heatmap: "YlOrRd"
+
+wordcloud:
+  background_color: "#1a1a2e"
+  max_words: 100
+  width: 800
+  height: 400
+  colormap: "viridis"
