@@ -18,10 +18,3 @@ plots:
   font_size: 12
   max_points_per_plot: 100
   heatmap: "YlOrRd"
-
-wordcloud:
-  background_color: "#1a1a2e"
-  max_words: 100
-  width: 800
-  height: 400
-  colormap: "viridis"
