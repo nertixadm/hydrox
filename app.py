@@ -3,12 +3,10 @@ import polars as pl
 import pandas as pd
 import plotly.express as px
 from hydrox import *
-import tempfile
-import os
 import io
 import zipfile
 import math
-from wordcloud import WordCloud
+from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -20,8 +18,10 @@ from collections import Counter
 import re
 from datetime import datetime, timedelta
 
+PROJECT_DIR = Path(__file__).resolve().parent
+
 st.set_page_config(layout="wide", page_title="Анализ чата Telegram")
-config = load_config("config.yaml")
+config = load_config(PROJECT_DIR / "config.yaml")
 colors = config['colors']
 session_gap = config['analysis']['session_gap_hours']
 top_n_default = config['analysis']['top_n_words']
@@ -289,7 +289,7 @@ def _time_spent(df):
     date_max = df['date'].max()
     span = date_max - date_min
 
-    sessions = analyze_sessions(df, gap_hours=8)
+    sessions = analyze_dialog_sessions(df, gap_hours=8)
     total_session_hours = float(sessions['duration_hours'].sum()) if sessions.height > 0 else 0
 
     return {
@@ -335,8 +335,8 @@ def generate_wrapped_slides(df, gift_df, cfg):
     accent2 = _hex_to_rgb(cfg['colors']['user2'])
 
     senders = df['sender'].unique().to_list()
-    if len(senders) < 2:
-        senders = senders + ['—'] * (2 - len(senders))
+    if len(senders) != 2:
+        raise ValueError("Для итогов чата нужно выбрать ровно двух пользователей")
     u1, u2 = senders[0], senders[1]
     u1_clean = _clean_name(u1)
     u2_clean = _clean_name(u2)
@@ -740,8 +740,9 @@ def generate_wrapped_slides(df, gift_df, cfg):
     return slides
 # ---------- ЗАГРУЗКА ФАЙЛА ----------
 # Лого и название в сайдбаре — на одной строке, лого выровнено по тексту
-if os.path.exists("hydrox_logo.jpg"):
-    with open("hydrox_logo.jpg", "rb") as _lf:
+logo_path = PROJECT_DIR / "hydrox_logo.jpg"
+if logo_path.exists():
+    with logo_path.open("rb") as _lf:
         logo_b64 = base64.b64encode(_lf.read()).decode()
     st.sidebar.markdown(
         f"""
@@ -775,11 +776,9 @@ def get_file_hash(file):
 if uploaded_file is not None:
     file_hash = get_file_hash(uploaded_file)
     if 'file_hash' not in st.session_state or st.session_state.file_hash != file_hash:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
-            tmp.write(uploaded_file.getvalue())
-            tmp_path = tmp.name
         with st.spinner("Загрузка и парсинг данных..."):
-            raw = load_data(tmp_path)
+            # Do not create an on-disk copy of a user's private chat export.
+            raw = load_data(io.BytesIO(uploaded_file.getvalue()))
             df = parse_messages(raw)
             gift_days, gift_counts = gifts_by_day(raw)
             if gift_days.len() > 0:
@@ -791,13 +790,10 @@ if uploaded_file is not None:
                 service_df = pl.DataFrame({'day': service_days, 'service_count': service_counts})
             else:
                 service_df = pl.DataFrame(schema={'day': pl.Date, 'service_count': pl.Int32})
-            call_stats = call_duration_stats(raw)
-            os.unlink(tmp_path)
         st.session_state.df = df
         st.session_state.raw = raw
         st.session_state.gift_df = gift_df
         st.session_state.service_df = service_df
-        st.session_state.call_stats = call_stats
         st.session_state.file_hash = file_hash
         st.session_state.file_loaded = True
     else:
@@ -805,7 +801,6 @@ if uploaded_file is not None:
         raw = st.session_state.raw
         gift_df = st.session_state.gift_df
         service_df = st.session_state.service_df
-        call_stats = st.session_state.call_stats
 
     if df.height == 0:
         st.error("Не удалось распарсить файл.")
@@ -820,16 +815,53 @@ if uploaded_file is not None:
             mask = (pl.col('date').cast(pl.Date) >= start_date) & (pl.col('date').cast(pl.Date) <= end_date)
             df_filtered = df.filter(mask)
         else:
+            start_date, end_date = date_min, date_max
             df_filtered = df
         senders = df_filtered['sender'].unique().to_list()
         selected_users = st.sidebar.multiselect("Выберите пользователей", senders, default=senders)
-        if selected_users:
-            df_filtered = df_filtered.filter(pl.col('sender').is_in(selected_users))
+        if not selected_users:
+            st.warning("Выберите хотя бы одного пользователя для анализа.")
+            st.stop()
+        df_filtered = df_filtered.filter(pl.col('sender').is_in(selected_users))
         max_rows = st.sidebar.number_input("Максимум сообщений для анализа (0 – все)",
                                            min_value=0, max_value=1000000, value=100000, step=10000)
         if max_rows > 0 and df_filtered.height > max_rows:
             df_filtered = df_filtered.tail(max_rows)
             st.sidebar.warning(f"Анализ ограничен {max_rows} последними сообщениями")
+
+        # Service events do not enter ``df``. Keep their metrics in the same
+        # date range as the selected messages, rather than using the full export.
+        raw_in_period = []
+        for message in raw:
+            try:
+                message_day = datetime.fromisoformat(
+                    message['date'].replace('Z', '+00:00')
+                ).date()
+            except (KeyError, TypeError, ValueError):
+                continue
+            if start_date <= message_day <= end_date:
+                raw_in_period.append(message)
+
+        if set(selected_users) == set(senders):
+            raw_in_scope = raw_in_period
+        else:
+            raw_in_scope = [
+                message for message in raw_in_period
+                if (
+                    message.get('from', 'Unknown') in selected_users
+                    if message.get('type') != 'service'
+                    else (message.get('from') or message.get('actor')) in selected_users
+                )
+            ]
+
+        gift_days, gift_counts = gifts_by_day(raw_in_scope)
+        gift_df_filtered = pl.DataFrame({'day': gift_days, 'gifts': gift_counts})
+        service_days, service_counts = service_by_day(raw_in_scope)
+        service_df_filtered = pl.DataFrame({
+            'day': service_days,
+            'service_count': service_counts,
+        })
+        call_stats_filtered = call_duration_stats(raw_in_scope)
         top_n = st.sidebar.slider("Количество топ-слов", 5, 50, top_n_default)
         days_ahead = st.sidebar.slider("Прогноз на дней вперёд", 1, 30, 7)
         include_service = st.sidebar.checkbox("Включить сервисные записи (звонки, подарки, закрепления)", value=False)
@@ -837,11 +869,11 @@ if uploaded_file is not None:
         st.sidebar.markdown("---")
 
         if st.sidebar.button("Создать «Итоги чата»", type="primary", use_container_width=True):
-            if df_filtered['sender'].n_unique() < 2:
-                st.sidebar.warning("Нужно минимум 2 пользователя")
+            if df_filtered['sender'].n_unique() != 2:
+                st.sidebar.warning("Нужно выбрать ровно 2 пользователей")
             else:
                 with st.spinner("Генерация слайдов..."):
-                    slides = generate_wrapped_slides(df_filtered, gift_df, config)
+                    slides = generate_wrapped_slides(df_filtered, gift_df_filtered, config)
                     st.sidebar.markdown(f"**Сгенерировано слайдов: {len(slides)}**")
                     for i, buf in enumerate(slides, 1):
                         st.sidebar.image(buf, caption=f"Слайд {i}", use_container_width=True)
@@ -909,7 +941,7 @@ if uploaded_file is not None:
         ])
 
         with tabs[0]:
-            gifts_total = gift_df['gifts'].sum() if gift_df.height > 0 else 0
+            gifts_total = gift_df_filtered['gifts'].sum() if gift_df_filtered.height > 0 else 0
             stats = cached_general_stats(df_filtered, gifts_total)
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Сообщений", stats['total_messages'])
@@ -930,13 +962,16 @@ if uploaded_file is not None:
             st.metric("Средняя длина текста", f"{stats['avg_text_length']:.1f} символов")
 
         with tabs[1]:
-            quality = data_quality_check(df_filtered, raw)
+            quality = data_quality_check(df_filtered, raw_in_scope)
             st.subheader("Контроль качества")
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Всего записей", quality['total_records'])
             col2.metric("Уникальных id", quality['unique_ids'])
             col3.metric("Дубликатов", quality['duplicates'])
-            col4.metric("Распознанных дат", f"{quality['dates_parsed']} / {len(raw)}")
+            col4.metric(
+                "Распознанных дат",
+                f"{quality['dates_parsed']} / {quality['message_records']}",
+            )
             st.write(f"Порядок времени: {'Корректен' if quality['ordered'] else 'Нарушен'}")
 
         with tabs[2]:
@@ -1092,7 +1127,7 @@ if uploaded_file is not None:
                 st.info("Недостаточно данных для анализа.")
 
         with tabs[10]:
-            daily = cached_daily_analytics(df_filtered, gift_df, service_df, include_service)
+            daily = cached_daily_analytics(df_filtered, gift_df_filtered, service_df_filtered, include_service)
             if daily.height > 0:
                 daily_pd = daily.to_pandas()
                 st.subheader("Ежедневная статистика (все дни)")
@@ -1115,7 +1150,7 @@ if uploaded_file is not None:
                 st.plotly_chart(fig, use_container_width=True)
 
         with tabs[11]:
-            monthly = cached_monthly_analytics(df_filtered, gift_df)
+            monthly = cached_monthly_analytics(df_filtered, gift_df_filtered)
             if monthly.height > 0:
                 monthly_pd = monthly.to_pandas()
                 st.subheader("Месячная статистика")
@@ -1139,8 +1174,8 @@ if uploaded_file is not None:
                 st.info("Нет данных для месячной статистики.")
 
         with tabs[12]:
-            service_info = service_actions_analysis(raw)
-            gifts_total = gift_df['gifts'].sum() if gift_df.height > 0 else 0
+            service_info = service_actions_analysis(raw_in_scope)
+            gifts_total = gift_df_filtered['gifts'].sum() if gift_df_filtered.height > 0 else 0
             stats = cached_general_stats(df_filtered, gifts_total)
             st.subheader("Редактирования и сервисные записи")
             col1, col2 = st.columns(2)
@@ -1149,14 +1184,14 @@ if uploaded_file is not None:
             if service_info['action_counts']:
                 st.write("Типы действий:")
                 st.dataframe(pd.DataFrame(service_info['action_counts'].items(), columns=['Действие', 'Количество']))
-            if call_stats:
+            if call_stats_filtered:
                 st.subheader("Статистика звонков")
                 col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Всего звонков", call_stats['total_calls'])
-                col2.metric("Общая длительность", f"{call_stats['total_duration_sec'] // 60} мин {call_stats['total_duration_sec'] % 60} сек")
-                col3.metric("Средняя длительность", f"{call_stats['avg_duration_sec']:.0f} сек")
-                col4.metric("Макс. длительность", f"{call_stats['max_duration']} сек")
-                fig = px.histogram(call_stats['durations_list'], nbins=20,
+                col1.metric("Всего звонков", call_stats_filtered['total_calls'])
+                col2.metric("Общая длительность", f"{call_stats_filtered['total_duration_sec'] // 60} мин {call_stats_filtered['total_duration_sec'] % 60} сек")
+                col3.metric("Средняя длительность", f"{call_stats_filtered['avg_duration_sec']:.0f} сек")
+                col4.metric("Макс. длительность", f"{call_stats_filtered['max_duration']} сек")
+                fig = px.histogram(call_stats_filtered['durations_list'], nbins=20,
                                    title='Распределение длительности звонков',
                                    labels={'value':'Длительность (сек)'})
                 st.plotly_chart(fig, use_container_width=True)

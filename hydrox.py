@@ -5,7 +5,6 @@ from collections import Counter, defaultdict
 import re
 import yaml
 import numpy as np
-import os
 from sklearn.linear_model import LinearRegression
 
 # ---------- ЗАГРУЗКА КОНФИГА ----------
@@ -14,9 +13,13 @@ def load_config(config_path="config.yaml"):
         return yaml.safe_load(f)
 
 # ---------- ЗАГРУЗКА ДАННЫХ ----------
-def load_data(filepath):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+def load_data(source):
+    """Load an export from a path or an already opened file object."""
+    if hasattr(source, 'read'):
+        data = json.load(source)
+    else:
+        with open(source, 'r', encoding='utf-8') as f:
+            data = json.load(f)
     if isinstance(data, dict):
         if 'messages' in data:
             messages = data['messages']
@@ -44,14 +47,27 @@ def parse_messages(messages):
     records = []
     append = records.append
     for msg in messages:
+        if not isinstance(msg, dict):
+            continue
         if msg.get('type') == 'service':
             continue
-        dt = datetime.fromisoformat(msg['date'].replace('Z', '+00:00'))
+        try:
+            dt = datetime.fromisoformat(msg['date'].replace('Z', '+00:00'))
+        except (KeyError, TypeError, ValueError):
+            continue
         sender = msg.get('from', 'Unknown')
         text = msg.get('text', '')
         if isinstance(text, list):
-            text = ''.join([part if isinstance(part, str) else part.get('text', '') 
-                            for part in text])
+            text = ''.join(
+                part if isinstance(part, str)
+                else str(part.get('text', '')) if isinstance(part, dict)
+                else ''
+                for part in text
+            )
+        elif text is None:
+            text = ''
+        elif not isinstance(text, str):
+            text = str(text)
         media_type = msg.get('media_type', None)
         if media_type is None:
             if 'photo' in msg:
@@ -81,7 +97,10 @@ def parse_messages(messages):
             else:
                 media_type = 'text'
         reactions = msg.get('reactions', [])
-        reactions_count = sum(r.get('count', 0) for r in reactions) if isinstance(reactions, list) else 0
+        reactions_count = (
+            sum(r.get('count', 0) for r in reactions if isinstance(r, dict))
+            if isinstance(reactions, list) else 0
+        )
         reply_to = msg.get('reply_to_message_id', None)
         edited = 1 if 'edited' in msg else 0
         msg_id = msg.get('id', None)
@@ -113,8 +132,13 @@ def parse_messages(messages):
 def gifts_by_day(raw_messages):
     gifts = defaultdict(int)
     for msg in raw_messages:
+        if not isinstance(msg, dict):
+            continue
         if msg.get('type') == 'service' and msg.get('action') == 'send_star_gift':
-            dt = datetime.fromisoformat(msg['date'].replace('Z', '+00:00'))
+            try:
+                dt = datetime.fromisoformat(msg['date'].replace('Z', '+00:00'))
+            except (KeyError, TypeError, ValueError):
+                continue
             gifts[dt.date()] += 1
     if gifts:
         return pl.Series(name='day', values=list(gifts.keys()), dtype=pl.Date), \
@@ -126,8 +150,13 @@ def gifts_by_day(raw_messages):
 def service_by_day(raw_messages):
     service = defaultdict(int)
     for msg in raw_messages:
+        if not isinstance(msg, dict):
+            continue
         if msg.get('type') == 'service':
-            dt = datetime.fromisoformat(msg['date'].replace('Z', '+00:00'))
+            try:
+                dt = datetime.fromisoformat(msg['date'].replace('Z', '+00:00'))
+            except (KeyError, TypeError, ValueError):
+                continue
             service[dt.date()] += 1
     if service:
         return pl.Series(name='day', values=list(service.keys()), dtype=pl.Date), \
@@ -162,13 +191,18 @@ def general_stats(df, gifts_total):
 # ---------- КОНТРОЛЬ КАЧЕСТВА ----------
 def data_quality_check(df, raw_messages):
     total_raw = len(raw_messages)
-    ids = [m.get('id') for m in raw_messages if 'id' in m]
+    ids = [m.get('id') for m in raw_messages if isinstance(m, dict) and 'id' in m]
     unique_ids = len(set(ids))
     duplicates = len(ids) - unique_ids
+    message_records = sum(
+        1 for m in raw_messages
+        if isinstance(m, dict) and m.get('type') != 'service'
+    )
     dates_parsed = df.height
     is_ordered = df['date'].is_sorted() if df.height > 0 else True
     return {
         'total_records': total_raw,
+        'message_records': message_records,
         'unique_ids': unique_ids,
         'duplicates': duplicates,
         'dates_parsed': dates_parsed,
@@ -206,7 +240,10 @@ def reactions_breakdown(df):
     all_reactions = Counter()
     for row in df.iter_rows(named=True):
         for r in row['reactions_list']:
-            emoji = r.get('emoji', r.get('type', 'unknown'))
+            if not isinstance(r, dict):
+                continue
+            # Telegram does not expose a printable emoji for custom reactions.
+            emoji = r.get('emoji') or 'custom'
             count = r.get('count', 1)
             all_reactions[emoji] += count
     return dict(all_reactions)
@@ -215,6 +252,8 @@ def reactions_breakdown(df):
 def call_duration_stats(raw_messages):
     durations = []
     for msg in raw_messages:
+        if not isinstance(msg, dict):
+            continue
         if msg.get('type') != 'service':
             continue
         action = msg.get('action', '')
@@ -333,6 +372,45 @@ def analyze_sessions(df, gap_hours=8):
                 'duration_hours': duration,
                 'messages': session_msgs
             })
+    return pl.DataFrame(sessions)
+
+
+def analyze_dialog_sessions(df, gap_hours=8):
+    """Build shared dialogue sessions without double-counting participants."""
+    if df.height == 0:
+        return pl.DataFrame(schema={
+            'start': pl.Datetime,
+            'end': pl.Datetime,
+            'duration_hours': pl.Float64,
+            'messages': pl.Int64,
+        })
+
+    sessions = []
+    session_start = session_end = prev_time = None
+    session_count = 0
+    for row in df.sort('date').iter_rows(named=True):
+        current_time = row['date']
+        if prev_time is None or (current_time - prev_time).total_seconds() / 3600 > gap_hours:
+            if session_start is not None:
+                sessions.append({
+                    'start': session_start,
+                    'end': session_end,
+                    'duration_hours': (session_end - session_start).total_seconds() / 3600,
+                    'messages': session_count,
+                })
+            session_start = current_time
+            session_count = 1
+        else:
+            session_count += 1
+        session_end = current_time
+        prev_time = current_time
+
+    sessions.append({
+        'start': session_start,
+        'end': session_end,
+        'duration_hours': (session_end - session_start).total_seconds() / 3600,
+        'messages': session_count,
+    })
     return pl.DataFrame(sessions)
 
 # ---------- ЕЖЕДНЕВНАЯ АНАЛИТИКА (с опцией include_service) ----------
@@ -510,7 +588,10 @@ def analyze_bigrams(df, stop_words, min_len=3, top_n=20):
 
 # ---------- СЕРВИСНЫЕ ЗАПИСИ ----------
 def service_actions_analysis(raw_messages):
-    service_msgs = [m for m in raw_messages if m.get('type') != 'message']
+    service_msgs = [
+        m for m in raw_messages
+        if isinstance(m, dict) and m.get('type') == 'service'
+    ]
     action_counts = Counter()
     for m in service_msgs:
         action = m.get('action', None)
