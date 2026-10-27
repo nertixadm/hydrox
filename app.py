@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.express as px
 from hydrox import *
 import io
+import json
 import zipfile
 import math
 from pathlib import Path
@@ -778,7 +779,12 @@ if uploaded_file is not None:
     if 'file_hash' not in st.session_state or st.session_state.file_hash != file_hash:
         with st.spinner("Загрузка и парсинг данных..."):
             # Do not create an on-disk copy of a user's private chat export.
-            raw = load_data(io.BytesIO(uploaded_file.getvalue()))
+            try:
+                raw = load_data(io.BytesIO(uploaded_file.getvalue()))
+            except (ValueError, json.JSONDecodeError) as e:
+                st.error(f"Не удалось прочитать файл: {e}")
+                st.session_state.pop('file_hash', None)
+                st.stop()
             df = parse_messages(raw)
             gift_days, gift_counts = gifts_by_day(raw)
             if gift_days.len() > 0:
@@ -868,7 +874,7 @@ if uploaded_file is not None:
 
         st.sidebar.markdown("---")
 
-        if st.sidebar.button("Создать «Итоги чата»", type="primary", use_container_width=True):
+        if st.sidebar.button("Создать «Итоги чата»", type="primary", width="stretch"):
             if df_filtered['sender'].n_unique() != 2:
                 st.sidebar.warning("Нужно выбрать ровно 2 пользователей")
             else:
@@ -876,7 +882,7 @@ if uploaded_file is not None:
                     slides = generate_wrapped_slides(df_filtered, gift_df_filtered, config)
                     st.sidebar.markdown(f"**Сгенерировано слайдов: {len(slides)}**")
                     for i, buf in enumerate(slides, 1):
-                        st.sidebar.image(buf, caption=f"Слайд {i}", use_container_width=True)
+                        st.sidebar.image(buf, caption=f"Слайд {i}", width="stretch")
                         buf.seek(0)
                     zip_buf = io.BytesIO()
                     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -953,12 +959,12 @@ if uploaded_file is not None:
             sender_df = pd.DataFrame(list(stats['sender_counts'].items()), columns=['Пользователь', 'Количество'])
             fig = px.pie(sender_df, values='Количество', names='Пользователь',
                          color_discrete_sequence=[colors['user1'], colors['user2']])
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             st.subheader("Типы сообщений")
             media_df = pd.DataFrame(list(stats['media_counts'].items()), columns=['Тип', 'Количество'])
             media_df = media_df.sort_values('Количество', ascending=False)
             fig = px.bar(media_df, x='Тип', y='Количество', color='Тип')
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             st.metric("Средняя длина текста", f"{stats['avg_text_length']:.1f} символов")
 
         with tabs[1]:
@@ -973,6 +979,8 @@ if uploaded_file is not None:
                 f"{quality['dates_parsed']} / {quality['message_records']}",
             )
             st.write(f"Порядок времени: {'Корректен' if quality['ordered'] else 'Нарушен'}")
+            if not quality['ordered']:
+                st.warning("Сообщения в файле не отсортированы по времени — сессии и темп диалога считаются по отсортированному ряду.")
 
         with tabs[2]:
             part_stats = cached_participant_stats(df_filtered)
@@ -992,7 +1000,7 @@ if uploaded_file is not None:
                 df_ps['Доля, %'] = df_ps['Доля, %'].round(1)
                 df_ps['Ср. слов'] = df_ps['Ср. слов'].round(1)
                 df_ps['Ср. символов'] = df_ps['Ср. символов'].round(1)
-                st.dataframe(df_ps, use_container_width=True, hide_index=True)
+                st.dataframe(df_ps, width="stretch", hide_index=True)
             else:
                 st.info("Нет данных")
 
@@ -1003,7 +1011,7 @@ if uploaded_file is not None:
                 react_df = pd.DataFrame(list(reactions.items()), columns=['Реакция', 'Количество'])
                 react_df = react_df.sort_values('Количество', ascending=True)
                 fig = px.bar(react_df, x='Реакция', y='Количество', color='Реакция', title='События реакций')
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 st.dataframe(react_df)
             else:
                 st.info("Нет реакций")
@@ -1014,7 +1022,7 @@ if uploaded_file is not None:
             fig = px.line(hourly, x='hour', y='count', color='sender',
                           title='Сообщения по часам', markers=True,
                           color_discrete_sequence=[colors['user1'], colors['user2']])
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             st.subheader("Тепловая карта: день недели / час")
             pivot = df_filtered.group_by(['weekday_name', 'hour']).agg(pl.len().alias('count')).to_pandas()
             pivot = pivot.pivot(index='weekday_name', columns='hour', values='count').fillna(0)
@@ -1022,7 +1030,7 @@ if uploaded_file is not None:
             pivot = pivot.reindex(days_order, axis=0)
             fig = px.imshow(pivot, labels=dict(x="Час", y="День недели", color="Сообщений"),
                             color_continuous_scale=config['plots']['heatmap'], aspect="auto")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         with tabs[5]:
             freq_result = cached_frequent_words(df_filtered, tuple(stop_words), top_n, min_len)
@@ -1031,7 +1039,7 @@ if uploaded_file is not None:
                 overall_df = pd.DataFrame(freq_result['overall'], columns=['Слово', 'Частота'])
                 fig = px.bar(overall_df, x='Слово', y='Частота', color='Слово',
                              title=f'Самые частые слова (топ-{top_n})')
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 st.subheader("По пользователям")
                 for sender, top_words in freq_result['users'].items():
                     with st.expander(f"{sender}"):
@@ -1039,7 +1047,7 @@ if uploaded_file is not None:
                             df_sender = pd.DataFrame(top_words, columns=['Слово', 'Частота'])
                             fig = px.bar(df_sender, x='Слово', y='Частота', color='Слово',
                                          title=f'Топ-{len(top_words)} слов для {sender}')
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, width="stretch")
                         else:
                             st.write("Нет слов.")
             else:
@@ -1052,7 +1060,7 @@ if uploaded_file is not None:
                 bigram_df = pd.DataFrame([(' '.join(b), c) for b, c in bigrams], columns=['Биграмма', 'Частота'])
                 fig = px.bar(bigram_df, x='Биграмма', y='Частота', color='Биграмма',
                              title='Самые частые биграммы')
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.info("Нет данных для биграмм.")
 
@@ -1068,7 +1076,7 @@ if uploaded_file is not None:
                 fig = px.histogram(sessions_pd, x='duration_hours', nbins=30,
                                    title='Распределение длительности сессий',
                                    labels={'duration_hours':'Часы'})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 st.subheader("Сессии по пользователям")
                 sender_session = sessions_pd.groupby('sender').agg(
                     сессий=('duration_hours', 'size'),
@@ -1087,7 +1095,7 @@ if uploaded_file is not None:
                 fig = px.histogram(word_counts_pd, nbins=50, title='Количество слов на сообщение')
                 fig.add_vline(x=word_counts_pd.median(), line_dash="dash", line_color="red", annotation_text=f"Медиана: {word_counts_pd.median():.0f}")
                 fig.add_vline(x=word_counts_pd.mean(), line_dash="dot", line_color="green", annotation_text=f"Среднее: {word_counts_pd.mean():.1f}")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 st.write(f"Медиана: {word_counts_pd.median():.0f} слов, 90-й перцентиль: {word_counts_pd.quantile(0.9):.0f}")
             else:
                 st.info("Нет текстовых сообщений.")
@@ -1104,7 +1112,7 @@ if uploaded_file is not None:
                     'p75': 'P75, мин',
                     'p90': 'P90, мин'
                 }).round(2)
-                st.dataframe(gap_df, use_container_width=True, hide_index=True)
+                st.dataframe(gap_df, width="stretch", hide_index=True)
                 def all_gaps_series(df, max_hours):
                     df_sorted = df.sort('date')
                     gaps_list = []
@@ -1122,7 +1130,7 @@ if uploaded_file is not None:
                     fig = px.histogram(gaps_pd, nbins=30, title='Общее распределение интервалов (мин)')
                     fig.add_vline(x=gaps_pd.median(), line_dash="dash", line_color="red", annotation_text=f"Медиана: {gaps_pd.median():.2f}")
                     fig.add_vline(x=gaps_pd.mean(), line_dash="dot", line_color="green", annotation_text=f"Среднее: {gaps_pd.mean():.2f}")
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
             else:
                 st.info("Недостаточно данных для анализа.")
 
@@ -1139,15 +1147,15 @@ if uploaded_file is not None:
                     'gifts': 'Подарков', 'service_count': 'Сервисных записей',
                     'peak_hour': 'Пиковый час'
                 })
-                st.dataframe(daily_display, use_container_width=True, hide_index=True)
+                st.dataframe(daily_display, width="stretch", hide_index=True)
                 st.subheader("Динамика сообщений по дням")
                 title = "Количество сообщений в день (включая сервисные)" if include_service else "Количество сообщений в день (только обычные)"
                 fig = px.line(daily_pd, x='day', y='total', title=title)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 st.subheader("Накопленный рост")
                 daily_pd['cumsum'] = daily_pd['total'].cumsum()
                 fig = px.line(daily_pd, x='day', y='cumsum', title='Накопленное количество сообщений')
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
         with tabs[11]:
             monthly = cached_monthly_analytics(df_filtered, gift_df_filtered)
@@ -1159,17 +1167,17 @@ if uploaded_file is not None:
                     'replies': 'Ответов', 'media': 'Медиа', 'reactions': 'Реакций',
                     'edits': 'Изменено', 'days_active': 'Дней активности', 'gifts': 'Подарков'
                 })
-                st.dataframe(monthly_display, use_container_width=True, hide_index=True)
+                st.dataframe(monthly_display, width="stretch", hide_index=True)
                 fig_messages = px.bar(monthly_pd, x='year_month',
                                       y=['messages', 'replies', 'media', 'gifts'],
                                       title='Сообщения, ответы, медиа и подарки по месяцам',
                                       barmode='group')
-                st.plotly_chart(fig_messages, use_container_width=True)
+                st.plotly_chart(fig_messages, width="stretch")
                 fig_words = px.line(monthly_pd, x='year_month',
                                     y=['messages', 'words', 'days_active'],
                                     title='Количество сообщений, слов и дней активности по месяцам',
                                     markers=True)
-                st.plotly_chart(fig_words, use_container_width=True)
+                st.plotly_chart(fig_words, width="stretch")
             else:
                 st.info("Нет данных для месячной статистики.")
 
@@ -1194,7 +1202,7 @@ if uploaded_file is not None:
                 fig = px.histogram(call_stats_filtered['durations_list'], nbins=20,
                                    title='Распределение длительности звонков',
                                    labels={'value':'Длительность (сек)'})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.info("Нет данных о длительности звонков.")
 
@@ -1207,19 +1215,19 @@ if uploaded_file is not None:
                 fig = px.line(hourly, x='hour', y='count', color='sender',
                               title='Активность по часам',
                               color_discrete_sequence=[colors['user1'], colors['user2']])
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 weekday = df_filtered.group_by(['weekday_name', 'sender']).agg(pl.len().alias('count')).sort('weekday_name').to_pandas()
                 fig = px.bar(weekday, x='weekday_name', y='count', color='sender', barmode='group',
                              title='Активность по дням недели',
                              color_discrete_sequence=[colors['user1'], colors['user2']])
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 media_by_user = df_filtered.group_by(['sender', 'media_type']).agg(pl.len().alias('count')).sort('count').to_pandas()
                 media_by_user = media_by_user.sort_values('count', ascending=True)
                 fig = px.bar(media_by_user, x='media_type', y='count', color='sender', barmode='group',
                              title='Типы сообщений по пользователям (по возрастанию)',
                              color_discrete_sequence=[colors['user1'], colors['user2']],
                              category_orders={"media_type": media_by_user['media_type'].tolist()})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.info("Для сравнения нужно выбрать ровно двух пользователей.")
 
@@ -1248,7 +1256,7 @@ if uploaded_file is not None:
                                 name='Прогноз', line=dict(dash='dash', color='red'))
                 fig.update_layout(title='Ежедневная активность и прогноз',
                                   xaxis_title='Дата', yaxis_title='Сообщений')
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 st.dataframe(pred_pd)
             else:
                 st.info("Недостаточно данных для прогноза.")
